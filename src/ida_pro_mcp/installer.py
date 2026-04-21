@@ -35,7 +35,7 @@ SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 IDA_HOST = "127.0.0.1"
-IDA_PORT = 13337
+IDA_PORT = 8744
 
 # NOTE: This is in the global scope on purpose
 if not os.path.exists(IDA_PLUGIN_PKG):

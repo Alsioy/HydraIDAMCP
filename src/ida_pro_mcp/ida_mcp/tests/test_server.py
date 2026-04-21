@@ -63,6 +63,8 @@ def _saved_target():
     """Preserve the currently selected IDA target across assertions."""
     old_host = server.IDA_HOST
     old_port = server.IDA_PORT
+    old_fallback = server._FALLBACK_SELECTED_TARGET
+    old_selected = server._SESSION_SELECTED_TARGETS.copy()
     old_session = getattr(server.mcp._transport_session_id, "data", None)
     old_exts = getattr(server.mcp._enabled_extensions, "data", set())
     try:
@@ -70,6 +72,9 @@ def _saved_target():
     finally:
         server.IDA_HOST = old_host
         server.IDA_PORT = old_port
+        server._FALLBACK_SELECTED_TARGET = old_fallback
+        server._SESSION_SELECTED_TARGETS.clear()
+        server._SESSION_SELECTED_TARGETS.update(old_selected)
         server.mcp._transport_session_id.data = old_session
         server.mcp._enabled_extensions.data = old_exts
 
@@ -85,7 +90,10 @@ def test_tools_list_keeps_discovery_and_launch_tools_when_ida_unreachable():
         assert "result" in result, f"Expected successful tools/list response, got: {result}"
         tool_names = {tool["name"] for tool in result["result"].get("tools", [])}
         assert "select_instance" in tool_names
+        assert "select_instance_by_binary" in tool_names
+        assert "select_instance_by_idb" in tool_names
         assert "list_instances" in tool_names
+        assert "current_instance" in tool_names
         assert "open_file" in tool_names
 
 
@@ -157,6 +165,327 @@ def test_ida_rpc_ext_flows_through_to_proxy_path():
             assert _RecordingConnection.calls[0]["path"] == "/mcp?ext=dbg"
         finally:
             server.http.client.HTTPConnection = original_conn
+
+
+@test()
+def test_select_instance_isolated_per_transport_session():
+    """Selecting an instance in one transport session must not affect another."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        server.probe_instance = lambda host, port: True
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            result_a = server.select_instance(20001)
+            assert result_a.get("success"), f"session A selection failed: {result_a}"
+            assert server._get_selected_target() == ("127.0.0.1", 20001)
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            result_b = server.select_instance(20002)
+            assert result_b.get("success"), f"session B selection failed: {result_b}"
+            assert server._get_selected_target() == ("127.0.0.1", 20002)
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            assert server._get_selected_target() == ("127.0.0.1", 20001)
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            assert server._get_selected_target() == ("127.0.0.1", 20002)
+        finally:
+            server.probe_instance = original_probe
+
+
+@test()
+def test_select_instance_reset_only_current_transport_session():
+    """Resetting one session should not clear another session's target selection."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        server.probe_instance = lambda host, port: True
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            server.select_instance(20001)
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            server.select_instance(20002)
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            reset = server.select_instance(0)
+            assert reset.get("success"), f"session A reset failed: {reset}"
+            assert server._get_selected_target() == ("127.0.0.1", 13337)
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            assert server._get_selected_target() == ("127.0.0.1", 20002)
+        finally:
+            server.probe_instance = original_probe
+
+
+@test()
+def test_select_instance_by_binary_isolated_per_transport_session():
+    """Binary-based selection should bind independently for each HTTP session."""
+    with _saved_target():
+        original_discover = server.discover_instances
+        server.discover_instances = lambda: [
+            {
+                "host": "127.0.0.1",
+                "port": 20001,
+                "pid": 101,
+                "binary": "chall-A.exe",
+                "idb_path": "D:/ctf/chall-A.i64",
+                "started_at": "2026-04-20T00:00:00+00:00",
+            },
+            {
+                "host": "127.0.0.1",
+                "port": 20002,
+                "pid": 102,
+                "binary": "chall-B.exe",
+                "idb_path": "D:/ctf/chall-B.i64",
+                "started_at": "2026-04-20T00:01:00+00:00",
+            },
+        ]
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            result_a = server.select_instance_by_binary("chall-A.exe")
+            assert result_a.get("success"), f"session A selection failed: {result_a}"
+            assert server._get_selected_target() == ("127.0.0.1", 20001)
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            result_b = server.select_instance_by_binary("chall-B.exe")
+            assert result_b.get("success"), f"session B selection failed: {result_b}"
+            assert server._get_selected_target() == ("127.0.0.1", 20002)
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            assert server._get_selected_target() == ("127.0.0.1", 20001)
+        finally:
+            server.discover_instances = original_discover
+
+
+@test()
+def test_select_instance_by_binary_reports_ambiguity():
+    """Binary-based selection should not guess when multiple instances share a name."""
+    with _saved_target():
+        original_discover = server.discover_instances
+        server.discover_instances = lambda: [
+            {
+                "host": "127.0.0.1",
+                "port": 20001,
+                "pid": 101,
+                "binary": "chall.exe",
+                "idb_path": "D:/ctf/set1/chall.i64",
+                "started_at": "2026-04-20T00:00:00+00:00",
+            },
+            {
+                "host": "127.0.0.1",
+                "port": 20002,
+                "pid": 102,
+                "binary": "chall.exe",
+                "idb_path": "D:/ctf/set2/chall.i64",
+                "started_at": "2026-04-20T00:01:00+00:00",
+            },
+        ]
+        try:
+            result = server.select_instance_by_binary("chall.exe")
+            assert result["success"] is False
+            assert "Multiple running IDA instances match binary" in result["error"]
+            assert len(result.get("candidates", [])) == 2
+        finally:
+            server.discover_instances = original_discover
+
+
+@test()
+def test_select_instance_by_idb_normalizes_windows_path():
+    """IDB-based selection should tolerate slash and case differences on Windows paths."""
+    with _saved_target():
+        original_discover = server.discover_instances
+        server.discover_instances = lambda: [
+            {
+                "host": "127.0.0.1",
+                "port": 20077,
+                "pid": 177,
+                "binary": "vm.exe",
+                "idb_path": "D:\\CTF\\RE\\VM\\vm.i64",
+                "started_at": "2026-04-20T00:00:00+00:00",
+            }
+        ]
+        try:
+            result = server.select_instance_by_idb("d:/ctf/re/vm/vm.i64")
+            assert result.get("success"), f"IDB selection failed: {result}"
+            assert result["port"] == 20077
+            assert server._get_selected_target() == ("127.0.0.1", 20077)
+        finally:
+            server.discover_instances = original_discover
+
+
+@test()
+def test_proxy_to_ida_uses_transport_specific_target():
+    """Proxy routing should use the current transport session's selected target."""
+    with _saved_target():
+        original_conn = server.http.client.HTTPConnection
+        _RecordingConnection.calls = []
+        server.http.client.HTTPConnection = _RecordingConnection
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+
+            server.mcp._transport_session_id.data = "http:session-A"
+            server._set_selected_target("127.0.0.1", 20001)
+            server._proxy_to_ida(b"{}")
+
+            server.mcp._transport_session_id.data = "http:session-B"
+            server._set_selected_target("127.0.0.1", 20002)
+            server._proxy_to_ida(b"{}")
+
+            assert len(_RecordingConnection.calls) == 2
+            assert _RecordingConnection.calls[0]["host"] == "127.0.0.1"
+            assert _RecordingConnection.calls[0]["port"] == 20001
+            assert _RecordingConnection.calls[1]["host"] == "127.0.0.1"
+            assert _RecordingConnection.calls[1]["port"] == 20002
+        finally:
+            server.http.client.HTTPConnection = original_conn
+
+
+@test()
+def test_current_instance_reports_session_selection_source():
+    """current_instance should expose the selected target and whether it came from session binding."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        original_discover = server.discover_instances
+        server.probe_instance = lambda host, port: True
+        server.discover_instances = lambda: [
+            {
+                "host": "127.0.0.1",
+                "port": 20001,
+                "pid": 123,
+                "binary": "chall-A",
+                "idb_path": "D:/ctf/chall-A.i64",
+                "started_at": "2026-04-20T00:00:00+00:00",
+            }
+        ]
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+            server.mcp._transport_session_id.data = "http:session-A"
+            server._set_selected_target("127.0.0.1", 20001)
+
+            result = server.current_instance()
+            assert result["source"] == "session"
+            assert result["host"] == "127.0.0.1"
+            assert result["port"] == 20001
+            assert result["binary"] == "chall-A"
+            assert result["reachable"] is True
+        finally:
+            server.probe_instance = original_probe
+            server.discover_instances = original_discover
+
+
+@test()
+def test_dead_default_target_refreshes_from_discovery():
+    """Unbound sessions should automatically move to a live discovered default target."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        original_discover = server.discover_instances
+
+        def fake_probe(host, port):
+            return port == 20088
+
+        server.probe_instance = fake_probe
+        server.discover_instances = lambda: [
+            {
+                "host": "127.0.0.1",
+                "port": 20088,
+                "pid": 888,
+                "binary": "chall-live",
+                "idb_path": "D:/ctf/chall-live.i64",
+                "started_at": "2026-04-20T00:00:00+00:00",
+            }
+        ]
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+            server.mcp._transport_session_id.data = "http:session-A"
+
+            assert server._get_selected_target() == ("127.0.0.1", 20088)
+            assert server.IDA_PORT == 20088
+        finally:
+            server.probe_instance = original_probe
+            server.discover_instances = original_discover
+
+
+@test()
+def test_dispatch_proxy_clears_dead_session_binding_on_error():
+    """Failed requests to a dead session-bound instance should clear that binding."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        original_proxy = server._proxy_to_instance
+
+        def fake_probe(host, port):
+            return port == 13337
+
+        def fake_proxy(host, port, payload):
+            raise RuntimeError("connection failed")
+
+        server.probe_instance = fake_probe
+        server._proxy_to_instance = fake_proxy
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+            server.mcp._transport_session_id.data = "http:session-A"
+            server._set_selected_target("127.0.0.1", 20001)
+
+            req = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "decompile", "arguments": {}}}
+            result = server.dispatch_proxy(req)
+
+            assert "error" in result, f"Expected error result, got: {result}"
+            assert server._get_selected_target() == ("127.0.0.1", 13337)
+            assert "was cleared because that IDA instance is no longer reachable" in result["error"]["message"]
+        finally:
+            server.probe_instance = original_probe
+            server._proxy_to_instance = original_proxy
+
+
+@test()
+def test_open_file_switches_only_at_proxy_layer():
+    """Top-level open_file should keep switch routing local to the proxy session."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        original_call = server._call_ida_tool
+        recorded = {}
+        server.probe_instance = lambda host, port: True
+
+        def fake_call(host, port, name, arguments):
+            recorded["host"] = host
+            recorded["port"] = port
+            recorded["name"] = name
+            recorded["arguments"] = dict(arguments)
+            return {
+                "success": True,
+                "host": "127.0.0.1",
+                "port": 20099,
+                "binary": "new.bin",
+                "pid": 4242,
+            }
+
+        server._call_ida_tool = fake_call
+        try:
+            server.IDA_HOST = "127.0.0.1"
+            server.IDA_PORT = 13337
+            server.mcp._transport_session_id.data = "http:session-A"
+            server._set_selected_target("127.0.0.1", 20001)
+
+            result = server.open_file("D:/ctf/new.bin", switch=True, timeout=5)
+            assert result.get("success"), f"open_file failed: {result}"
+            assert recorded["name"] == "open_file"
+            assert recorded["arguments"]["switch"] is False
+            assert server._get_selected_target() == ("127.0.0.1", 20099)
+        finally:
+            server.probe_instance = original_probe
+            server._call_ida_tool = original_call
 
 
 # ---------------------------------------------------------------------------

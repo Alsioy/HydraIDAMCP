@@ -1,367 +1,491 @@
-# IDA Pro MCP
+<p align="center">
+  <img src=".github/logo.png" alt="HydraIDAMCP" width="160" />
+</p>
 
-Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
+<h1 align="center">HydraIDAMCP</h1>
 
-https://github.com/user-attachments/assets/6ebeaa92-a9db-43fa-b756-eececce2aca0
+<p align="center">
+  面向多题并行场景的 <code>ida-pro-mcp</code> 多会话增强版
+</p>
 
-The binaries and prompt for the video are available in the [mcp-reversing-dataset](https://github.com/mrexodia/mcp-reversing-dataset) repository.
+<p align="center">
+  <a href="./README_EN.md">English</a>
+</p>
 
-## Prerequisites
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-blue" />
+  <img alt="IDA Pro" src="https://img.shields.io/badge/IDA%20Pro-8.3%2B-orange" />
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-lightgrey" />
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green" />
+</p>
 
-- [Python](https://www.python.org/downloads/) (**3.11 or higher**)
-  - Use `idapyswitch` to switch to the newest Python version
-- [IDA Pro](https://hex-rays.com/ida-pro) (8.3 or higher, 9 recommended), **IDA Free is not supported**
-- Supported MCP Client (pick one you like)
-  - [Amazon Q Developer CLI](https://aws.amazon.com/q/developer/)
-  - [Augment Code](https://www.augmentcode.com/)
-  - [Claude](https://claude.ai/download)
-  - [Claude Code](https://www.anthropic.com/code)
-  - [Cline](https://cline.bot)
-  - [Codex](https://github.com/openai/codex)
-  - [Copilot CLI](https://docs.github.com/en/copilot)
-  - [Crush](https://github.com/charmbracelet/crush)
-  - [Cursor](https://cursor.com)
-  - [Gemini CLI](https://google-gemini.github.io/gemini-cli/)
-  - [Kilo Code](https://www.kilocode.com/)
-  - [Kiro](https://kiro.dev/)
-  - [LM Studio](https://lmstudio.ai/)
-  - [Opencode](https://opencode.ai/)
-  - [Qodo Gen](https://www.qodo.ai/)
-  - [Qwen Coder](https://qwenlm.github.io/qwen-code-docs/)
-  - [Roo Code](https://roocode.com)
-  - [Trae](https://trae.ai/)
-  - [VS Code](https://code.visualstudio.com/)
-  - [VS Code Insiders](https://code.visualstudio.com/insiders)
-  - [Warp](https://www.warp.dev/)
-  - [Windsurf](https://windsurf.com)
-  - [Zed](https://zed.dev/)
-  - [Other MCP Clients](https://modelcontextprotocol.io/clients#example-clients): Run `ida-pro-mcp --config` to get the JSON config for your client.
+HydraIDAMCP（简称 **HydraMCP**）是基于 [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) 的增强版本，主要解决 **CTF / RE / PWN / Malware** 等场景下“**同时打开多个 IDA，但模型总是容易连错实例**”的问题。
 
-## Installation
+它不是重写一个新的 MCP，而是在原有插件和服务架构基础上增加了：
 
-Install the latest version of the IDA Pro MCP package:
+- **共享代理入口**：统一连接 `http://127.0.0.1:8744/mcp`
+- **多 IDA 实例并行**：每个 IDA 使用独立本地端口
+- **按会话绑定实例**：不同 MCP 会话可绑定到不同 IDA
+- **实例选择工具**：支持按 `binary` 或 `idb` 精确切换
+- **自动生成提示词**：启动后直接生成可发给模型的 prompt
+- **支持自定义 prompt 模板**：保留你的个人分析习惯
 
-```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+> 如果你经常同时开多个题、多个 IDA、多个对话窗口，HydraMCP 的目标就是：**始终让模型分析到正确的那个实例。**
+
+---
+
+## 特性
+
+- 固定共享代理入口：`8744`
+- 自动发现并管理多个本地 IDA MCP 实例
+- 每个 IDA 自动分配独立端口，如 `13777`、`13778`、`13779`
+- 支持按 MCP transport session 绑定实例
+- IDA 内一键启动：`Ctrl + Alt + M`
+- 自动生成带绑定步骤的 prompt
+- 支持 `select_instance_by_binary(...)`
+- 支持 `select_instance_by_idb(...)`
+- 支持 `current_instance()`
+- 支持 `list_instances()`
+- 支持自定义 prompt 模板
+- 与上游 `ida-pro-mcp` 的包名与 CLI 保持兼容
+
+---
+
+## 为什么需要 HydraIDAMCP
+
+原版 `ida-pro-mcp` 更偏向单实例工作流：
+
+- 1 个 IDA
+- 1 个 MCP 服务
+- 1 条分析链路
+
+但在真实的 CTF 二进制题场景里，往往是：
+
+- 同时打开 2~5 个 IDA
+- 每个题一个 IDB
+- 模型需要明确知道“当前到底分析哪一个”
+- 不希望每开一个 IDA 就去修改一次 MCP 配置
+
+HydraIDAMCP 解决的核心问题就是：
+
+> **多个 IDA 实例共用一个 MCP 入口，同时允许每个会话稳定地绑定到正确的目标。**
+
+---
+
+## 架构
+
+HydraMCP 采用两层结构：
+
+1. **共享代理（Shared Proxy）**
+   - 固定入口：`127.0.0.1:8744`
+   - MCP 客户端只需要连接这一个地址
+
+2. **本地实例（Local IDA Instance）**
+   - 每个 IDA 启动一个自己的本地 MCP 服务
+   - 默认从 `13777` 开始自动分配空闲端口
+
+```mermaid
+flowchart LR
+    A["Codex / Claude Code / 其他 MCP 客户端"] --> B["HydraMCP 共享代理<br/>127.0.0.1:8744/mcp"]
+    B --> C1["IDA 实例 A<br/>127.0.0.1:13777/mcp"]
+    B --> C2["IDA 实例 B<br/>127.0.0.1:13778/mcp"]
+    B --> C3["IDA 实例 C<br/>127.0.0.1:13779/mcp"]
 ```
 
-Configure the MCP servers and install the IDA Plugin:
+共享代理内部维护：
 
+> **MCP transport session -> IDA instance**
+
+因此不同会话可以分别绑定到不同题目，而不是全部抢同一个 IDA。
+
+---
+
+## 快速开始
+
+### 1）安装项目
+
+如果你是从源码使用，推荐这样安装：
+
+```bash
+git clone https://github.com/<你的用户名>/HydraIDAMCP.git
+cd HydraIDAMCP
+pip uninstall ida-pro-mcp -y
+pip install -e .
 ```
+
+如果你后续发布到了 GitHub，也可以直接安装：
+
+```bash
+pip uninstall ida-pro-mcp -y
+pip install git+https://github.com/<你的用户名>/HydraIDAMCP.git
+```
+
+### 2）安装插件到 IDA
+
+```bash
 ida-pro-mcp --install
 ```
 
-**Important**: Make sure you completely restart IDA and your MCP client for the installation to take effect. Some clients (like Claude) run in the background and need to be quit from the tray icon.
+> 命令名依然是 `ida-pro-mcp`，这是兼容设计，不是写错了。
 
-https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
+### 3）配置 MCP 客户端
 
-_Note_: You need to load a binary in IDA before the plugin menu will show up.
+把 MCP 客户端统一指向共享代理：
 
-## Prompt Engineering
-
-LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
-
-```md
-Your task is to analyze a crackme in IDA Pro. You can use the MCP tools to retrieve information. In general use the following strategy:
-
-- Inspect the decompilation and add comments with your findings
-- Rename variables to more sensible names
-- Change the variable and argument types if necessary (especially pointer and array types)
-- Change function names to be more descriptive
-- If more details are necessary, disassemble the function and add comments with your findings
-- NEVER convert number bases yourself. Use the `int_convert` MCP tool if needed!
-- Do not attempt brute forcing, derive any solutions purely from the disassembly and simple python scripts
-- Create a report.md with your findings and steps taken at the end
-- When you find a solution, prompt to user for feedback with the password you found
+```toml
+[mcp_servers.ida_pro_mcp]
+enabled = true
+url = "http://127.0.0.1:8744/mcp"
 ```
 
-This prompt was just the first experiment, please share if you found ways to improve the output!
+### 4）在每个 IDA 中启动
 
-Another prompt by [@can1357](https://github.com/can1357):
+打开题目后，在每个 IDA 窗口中按：
 
-```md
-Your task is to create a complete and comprehensive reverse engineering analysis. Reference AGENTS.md to understand the project goals and ensure the analysis serves our purposes.
-
-Use the following systematic methodology:
-
-1. **Decompilation Analysis**
-   - Thoroughly inspect the decompiler output
-   - Add detailed comments documenting your findings
-   - Focus on understanding the actual functionality and purpose of each component (do not rely on old, incorrect comments)
-
-2. **Improve Readability in the Database**
-   - Rename variables to sensible, descriptive names
-   - Correct variable and argument types where necessary (especially pointers and array types)
-   - Update function names to be descriptive of their actual purpose
-
-3. **Deep Dive When Needed**
-   - If more details are necessary, examine the disassembly and add comments with findings
-   - Document any low-level behaviors that aren't clear from the decompilation alone
-   - Use sub-agents to perform detailed analysis
-
-4. **Important Constraints**
-   - NEVER convert number bases yourself - use the int_convert MCP tool if needed
-   - Use MCP tools to retrieve information as necessary
-   - Derive all conclusions from actual analysis, not assumptions
-
-5. **Documentation**
-   - Produce comprehensive RE/*.md files with your findings
-   - Document the steps taken and methodology used
-   - When asked by the user, ensure accuracy over previous analysis file
-   - Organize findings in a way that serves the project goals outlined in AGENTS.md or CLAUDE.md
+```text
+Ctrl + Alt + M
 ```
 
-Live stream discussing prompting and showing some real-world malware analysis:
+插件会自动：
 
-[![](https://img.youtube.com/vi/iFxNuk3kxhk/0.jpg)](https://www.youtube.com/watch?v=iFxNuk3kxhk)
+1. 检查共享代理 `8744` 是否已运行
+2. 如未运行，自动拉起共享代理
+3. 为当前 IDA 分配本地端口
+4. 注册当前实例
+5. 生成一段可直接发给模型的 prompt
 
-## Tips for Enhancing LLM Accuracy
+### 5）把生成的 prompt 发给模型
 
-Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `int_convert` MCP tool and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
+自动生成的 prompt 默认已经包含：
 
-Another thing to keep in mind is that LLMs will not perform well on obfuscated code. Before trying to use an LLM to solve the problem, take a look around the binary and spend some time (automatically) removing the following things:
+- 当前 `IDB`
+- 当前 `Binary`
+- 绑定步骤
+- `select_instance_by_idb(...)`
+- `select_instance_by_binary(...)`
+- `current_instance()`
 
-- String encryption
-- Import hashing
-- Control flow flattening
-- Code encryption
-- Anti-decompilation tricks
+所以多数情况下，你只需要：
 
-You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
+> **打开 IDA -> 按 `Ctrl + Alt + M` -> 把生成的 prompt 发给模型**
 
-## SSE Transport & Headless MCP
+---
 
-You can run an SSE server to connect to the user interface like this:
+## 安装说明
 
-```sh
-uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
+### 环境要求
+
+- Python **3.11+**
+- IDA Pro **8.3+** / **9.x**
+- 可用的 IDAPython 环境
+- **不支持 IDA Free**
+
+### 方式一：从源码安装
+
+```bash
+git clone https://github.com/<你的用户名>/HydraIDAMCP.git
+cd HydraIDAMCP
+pip uninstall ida-pro-mcp -y
+pip install -e .
+ida-pro-mcp --install
 ```
 
-After installing [`idalib`](https://docs.hex-rays.com/user-guide/idalib) you can also run a headless SSE server:
+### 方式二：从 GitHub 直接安装
 
-```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
+```bash
+pip uninstall ida-pro-mcp -y
+pip install git+https://github.com/<你的用户名>/HydraIDAMCP.git
+ida-pro-mcp --install
 ```
 
-_Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
+### 安装后注意事项
 
-## Headless idalib Session Model
+- 安装插件后请**完整重启 IDA**
+- 某些 MCP 客户端可能会常驻后台，也建议彻底退出再重新打开
+- 如果你之前装过原版 `ida-pro-mcp`，建议先卸载再装当前版本
 
-Use `--isolated-contexts` to enable strict per-transport isolation:
+---
 
-```sh
-uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/executable
+## 使用方式
+
+HydraMCP 的日常使用可以非常简单。
+
+### 1. 打开目标
+
+每个题目开一个 IDA。
+
+### 2. 在每个 IDA 中按一次快捷键
+
+```text
+Ctrl + Alt + M
 ```
 
-### Why use `--isolated-contexts`?
+这一键会自动完成：
 
-Use it when multiple agents connect to the same `idalib-mcp` server and you want deterministic context isolation:
+- 启动或复用共享代理
+- 启动当前 IDA 对应的本地 MCP 实例
+- 注册当前实例
+- 生成可直接使用的 prompt
 
-- Prevent one agent from changing another agent's active session accidentally.
-- Run concurrent analyses safely (for example agent A on binary X and agent B on binary Y).
-- Still allow intentional collaboration by binding multiple agents to the same open session ID.
-- Improve reproducibility because each agent's context binding is explicit.
+### 3. 直接把自动生成的 prompt 发给模型
 
-When `--isolated-contexts` is enabled:
+这是 HydraMCP 的一个实用小优点：
 
-- Each transport context has its own binding (`Mcp-Session-Id` for `/mcp`, `session` for `/sse`, `stdio:default` for stdio).
-- Unbound contexts fail fast for IDB-dependent tools/resources.
-- `idalib_switch(session_id)` and `idalib_open(...)` bind the caller context only.
+- **自动生成 prompt**
+- **prompt 自带绑定参数**
+- **prompt 自带绑定步骤**
+- **不需要你每次手写 `select_instance...`**
 
-### Streamable HTTP behavior
+也就是说，模型一开始就知道：
 
-With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled, including `Mcp-Session-Id` validation.
+- 当前该分析哪个题
+- 应该先调用哪些 IDA MCP 工具
+- 不应该切换到别的 IDA 实例
 
-### Context tools
+### 4. 只有在需要时才手动切换
 
-- `idalib_open(input_path, ...)`: Open binary and bind it to the active context policy.
-- `idalib_switch(session_id)`: Rebind the active context policy to an existing session.
-- `idalib_current()`: Return the session bound to the active context policy.
-- `idalib_unbind()`: Remove the active context binding.
-- `idalib_list()`: Includes `is_active`, `is_current_context`, and `bound_contexts`.
+如果你确实想手动绑定或切换实例，也可以直接使用：
 
-
-## MCP Resources
-
-**Resources** represent browsable state (read-only data) following MCP's philosophy.
-
-**Core IDB State:**
-- `ida://idb/metadata` - IDB file info (path, arch, base, size, hashes)
-- `ida://idb/segments` - Memory segments with permissions
-- `ida://idb/entrypoints` - Entry points (main, TLS callbacks, etc.)
-
-**UI State:**
-- `ida://cursor` - Current cursor position and function
-- `ida://selection` - Current selection range
-
-**Type Information:**
-- `ida://types` - All local types
-- `ida://structs` - All structures/unions
-- `ida://struct/{name}` - Structure definition with fields
-
-**Lookups:**
-- `ida://import/{name}` - Import details by name
-- `ida://export/{name}` - Export details by name
-- `ida://xrefs/from/{addr}` - Cross-references from address
-
-## Core Functions
-
-- `lookup_funcs(queries)`: Get function(s) by address or name (auto-detects, accepts list or comma-separated string).
-- `int_convert(inputs)`: Convert numbers to different formats (decimal, hex, bytes, ASCII, binary).
-- `list_funcs(queries)`: List functions (paginated, filtered).
-- `list_globals(queries)`: List global variables (paginated, filtered).
-- `imports(offset, count)`: List all imported symbols with module names (paginated).
-- `decompile(addr)`: Decompile function at the given address.
-- `disasm(addr)`: Disassemble function with full details (arguments, stack frame, etc).
-- `xrefs_to(addrs)`: Get all cross-references to address(es).
-- `xrefs_to_field(queries)`: Get cross-references to specific struct field(s).
-- `callees(addrs)`: Get functions called by function(s) at address(es).
-
-## Modification Operations
-
-- `set_comments(items)`: Set comments at address(es) in both disassembly and decompiler views.
-- `patch_asm(items)`: Patch assembly instructions at address(es).
-- `declare_type(decls)`: Declare C type(s) in the local type library.
-- `define_func(items)`: Define function(s) at address(es). Optionally specify `end` for explicit bounds.
-- `define_code(items)`: Convert bytes to code instruction(s) at address(es).
-- `undefine(items)`: Undefine item(s) at address(es), converting back to raw bytes. Optionally specify `end` or `size`.
-
-## Memory Reading Operations
-
-- `get_bytes(addrs)`: Read raw bytes at address(es).
-- `get_int(queries)`: Read integer values using ty (i8/u64/i16le/i16be/etc).
-- `get_string(addrs)`: Read null-terminated string(s).
-- `get_global_value(queries)`: Read global variable value(s) by address or name (auto-detects, compile-time values).
-
-## Stack Frame Operations
-
-- `stack_frame(addrs)`: Get stack frame variables for function(s).
-- `declare_stack(items)`: Create stack variable(s) at specified offset(s).
-- `delete_stack(items)`: Delete stack variable(s) by name.
-
-## Structure Operations
-
-- `read_struct(queries)`: Read structure field values at specific address(es).
-- `search_structs(filter)`: Search structures by name pattern.
-
-## Debugger Operations (Extension)
-
-Debugger tools are hidden by default. Enable with `?ext=dbg` query parameter:
-
-```
-http://127.0.0.1:13337/mcp?ext=dbg
+```text
+list_instances()
+current_instance()
+select_instance("127.0.0.1", 13778)
+select_instance_by_binary("checkin.exe")
+select_instance_by_idb("D:/ctf/re/checkin/checkin.i64")
 ```
 
-**Control:**
-- `dbg_start()`: Start debugger process.
-- `dbg_exit()`: Exit debugger process.
-- `dbg_continue()`: Continue execution.
-- `dbg_run_to(addr)`: Run to address.
-- `dbg_step_into()`: Step into instruction.
-- `dbg_step_over()`: Step over instruction.
+一句话工作流：
 
-**Breakpoints:**
-- `dbg_bps()`: List all breakpoints.
-- `dbg_add_bp(addrs)`: Add breakpoint(s).
-- `dbg_delete_bp(addrs)`: Delete breakpoint(s).
-- `dbg_toggle_bp(items)`: Enable/disable breakpoint(s).
+> **打开 IDA -> 按 `Ctrl + Alt + M` -> 发送自动生成的 prompt**
 
-**Registers:**
-- `dbg_regs()`: All registers, current thread.
-- `dbg_regs_all()`: All registers, all threads.
-- `dbg_regs_remote(tids)`: All registers, specific thread(s).
-- `dbg_gpregs()`: GP registers, current thread.
-- `dbg_gpregs_remote(tids)`: GP registers, specific thread(s).
-- `dbg_regs_named(names)`: Named registers, current thread.
-- `dbg_regs_named_remote(tid, names)`: Named registers, specific thread.
+---
 
-**Stack & Memory:**
-- `dbg_stacktrace()`: Call stack with module/symbol info.
-- `dbg_read(regions)`: Read memory from debugged process.
-- `dbg_write(regions)`: Write memory to debugged process.
+## Prompt 模板
 
-## Advanced Analysis Operations
+HydraMCP 支持本地 prompt 模板，用来生成“只分析当前实例”的提示词。
 
-- `py_eval(code)`: Execute arbitrary Python code in IDA context (returns dict with result/stdout/stderr, supports Jupyter-style evaluation).
-- `analyze_funcs(addrs)`: Comprehensive function analysis (decompilation, assembly, xrefs, callees, callers, strings, constants, basic blocks).
+这部分的设计目标很明确：
 
-## Pattern Matching & Search
+- 默认模板足够短，开箱即用
+- 自动带上当前实例的绑定参数
+- 不干扰你原本的分析思路
+- 允许你改成自己喜欢的风格
 
-- `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
-- `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
-- `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
-- `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.
+### 默认路径
 
-## Control Flow Analysis
+Windows：
 
-- `basic_blocks(addrs)`: Get basic blocks with successors and predecessors.
-
-## Type Operations
-
-- `set_type(edits)`: Apply type(s) to functions, globals, locals, or stack variables.
-- `infer_types(addrs)`: Infer types at address(es) using Hex-Rays or heuristics.
-
-## Export Operations
-
-- `export_funcs(addrs, format)`: Export function(s) in specified format (json, c_header, or prototypes).
-
-## Graph Operations
-
-- `callgraph(roots, max_depth)`: Build call graph from root function(s) with configurable depth.
-
-## Batch Operations
-
-- `rename(batch)`: Unified batch rename operation for functions, globals, locals, and stack variables (accepts dict with optional `func`, `data`, `local`, `stack` keys).
-- `patch(patches)`: Patch multiple byte sequences at once.
-- `put_int(items)`: Write integer values using ty (i8/u64/i16le/i16be/etc).
-
-**Key Features:**
-
-- **Type-safe API**: All functions use strongly-typed parameters with TypedDict schemas for better IDE support and LLM structured outputs
-- **Batch-first design**: Most operations accept both single items and lists
-- **Consistent error handling**: All batch operations return `[{..., error: null|string}, ...]`
-- **Cursor-based pagination**: Search functions return `cursor: {next: offset}` or `{done: true}` (default limit: 1000, enforced max: 10000 to prevent token overflow)
-- **Performance**: Strings are cached with MD5-based invalidation to avoid repeated `build_strlist` calls in large projects
-
-## Comparison with other MCP servers
-
-There are a few IDA Pro MCP servers floating around, but I created my own for a few reasons:
-
-1. Installation should be fully automated.
-2. The architecture of other plugins make it difficult to add new functionality quickly (too much boilerplate of unnecessary dependencies).
-3. Learning new technologies is fun!
-
-If you want to check them out, here is a list (in the order I discovered them):
-
-- https://github.com/taida957789/ida-mcp-server-plugin (SSE protocol only, requires installing dependencies in IDAPython).
-- https://github.com/fdrechsler/mcp-server-idapro (MCP Server in TypeScript, excessive boilerplate required to add new functionality).
-- https://github.com/MxIris-Reverse-Engineering/ida-mcp-server (custom socket protocol, boilerplate).
-
-Feel free to open a PR to add your IDA Pro MCP server here.
-
-## Development
-
-Adding new features is a super easy and streamlined process. All you have to do is add a new `@tool` function to the modular API files in `src/ida_pro_mcp/ida_mcp/api_*.py` and your function will be available in the MCP server without any additional boilerplate! Below is a video where I add the `get_metadata` function in less than 2 minutes (including testing):
-
-https://github.com/user-attachments/assets/951de823-88ea-4235-adcb-9257e316ae64
-
-To test the MCP server itself:
-
-```sh
-npx -y @modelcontextprotocol/inspector
+```text
+%APPDATA%\Hex-Rays\IDA Pro\mcp\prompt_template.txt
 ```
 
-This will open a web interface at http://localhost:5173 and allow you to interact with the MCP tools for testing.
+也可以通过环境变量指定：
 
-For testing I create a symbolic link to the IDA plugin and then POST a JSON-RPC request directly to `http://localhost:13337/mcp`. After [enabling symbolic links](https://learn.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development) you can run the following command:
-
-```sh
-uv run ida-pro-mcp --install
+```text
+IDA_MCP_PROMPT_TEMPLATE
 ```
 
-Generate the changelog of direct commits to `main`:
+### 默认模板示例
 
-```sh
-git log --first-parent --no-merges 1.2.0..main "--pretty=- %s"
+```text
+你现在是 CTF 二进制分析与解题助手。
+
+请调用 IDA MCP 分析当前题目。
+
+请只分析这个题目，不要切换到其他 IDA 实例。
+
+IDB: {idb_path}
+Binary: {binary}
+
+先绑定并确认当前实例：
+{binding_steps}
+
+题目类型:
+题目描述:
+目标:
 ```
+
+### 支持的占位符
+
+- `{idb_path}`
+- `{binary}`
+- `{binding_steps}`
+- `{local_instance_url}`
+- `{shared_proxy_url}`
+- `{select_instance_by_idb}`
+- `{select_instance_by_binary}`
+- `{current_instance_call}`
+- `{list_instances_call}`
+
+### 自定义模板
+
+你可以直接修改模板文件，让它更符合自己的工作流，例如：
+
+- 更偏 RE
+- 更偏 PWN
+- 更偏 Malware
+- 更偏个人习惯
+
+HydraMCP 不限制模板风格，只负责把当前实例信息和绑定参数正确注入进去。
+
+---
+
+## 常用工具
+
+```text
+list_instances()
+current_instance()
+select_instance("127.0.0.1", 13778)
+select_instance_by_binary("checkin.exe")
+select_instance_by_idb("D:/ctf/re/checkin/checkin.i64")
+```
+
+---
+
+## 兼容性说明
+
+为了尽量减少迁移成本，HydraIDAMCP 保留了上游的包名和 CLI 名称：
+
+- Python 包名：`ida_pro_mcp`
+- CLI 命令名：`ida-pro-mcp`
+
+因此：
+
+- **项目名 / GitHub 仓库名**：`HydraIDAMCP`
+- **简称**：`HydraMCP`
+- **运行时包名**：仍然兼容 `ida-pro-mcp`
+
+这使它更像一个**增强版构建**，而不是一套全新命名的新工具链。
+
+---
+
+## 项目结构
+
+```text
+src/ida_pro_mcp/server.py        # 共享代理、多实例路由、实例选择工具
+src/ida_pro_mcp/ida_mcp.py       # IDA 插件入口、自动拉起共享代理、prompt 模板
+src/ida_pro_mcp/installer.py     # 安装器与 MCP 客户端配置生成
+src/ida_pro_mcp/ida_mcp/         # 上游 ida-pro-mcp 插件实现及子模块
+tests/                           # 测试
+```
+
+---
+
+## 常见问题
+
+### 这是一个全新的 MCP 服务吗？
+
+不是。  
+HydraIDAMCP 是在原有 `ida-pro-mcp` 基础上做的多会话增强，不是重写协议栈。
+
+### 为什么项目叫 HydraIDAMCP，但命令还是 `ida-pro-mcp`？
+
+这是为了兼容现有安装方式、CLI 和插件逻辑。  
+项目名是 HydraIDAMCP，运行时仍保留 `ida-pro-mcp`。
+
+### 为什么共享代理启动失败？
+
+常见原因：
+
+- 当前 Python 环境没有安装本项目
+- 原版 `ida-pro-mcp` 与当前版本混装
+- `8744` 端口已被占用
+
+建议重新安装：
+
+```bash
+pip uninstall ida-pro-mcp -y
+pip install -e .
+```
+
+### 为什么多个题同时开着，但模型看起来还是串行的？
+
+这通常不完全是 HydraMCP 的问题。  
+并发体验还会受到这些因素影响：
+
+- MCP 客户端本身的工具调度策略
+- 模型供应商的 tool-calling 排队机制
+- 单次工具调用耗时较长
+
+HydraMCP 解决的是：
+
+> **多实例可并存、可发现、可绑定、可切换、可路由**
+
+但不强制所有客户端都并行发请求。
+
+### 如果 IDA 报 `U+FEFF` / BOM 错误怎么办？
+
+请确保插件文件编码为：
+
+- UTF-8 **无 BOM**
+
+否则 IDA 可能报：
+
+```text
+invalid non-printable character U+FEFF
+```
+
+---
+
+## 路线图
+
+当前版本已经可以满足多题并行使用，后续仍可以继续完善：
+
+- [ ] 实例别名 / 标签
+- [ ] 更清晰的实例状态展示
+- [ ] 按题型划分的 prompt 模板（RE / PWN / Malware）
+- [ ] 异常退出后的实例自动清理
+- [ ] 更多 MCP 客户端兼容性测试
+
+---
+
+## 建议的 GitHub 信息
+
+**仓库名**
+
+```text
+HydraIDAMCP
+```
+
+**简称**
+
+```text
+HydraMCP
+```
+
+**描述**
+
+```text
+ida-pro-mcp 的多会话增强版，提供共享代理、实例路由与自动生成 prompt，适合多 IDA 并行分析。
+```
+
+**Topics**
+
+```text
+ida
+mcp
+ctf
+reverse-engineering
+binary-analysis
+idapro
+llm-tools
+codex
+claude-code
+```
+
+---
+
+## 致谢
+
+HydraIDAMCP 基于以下项目构建：
+
+- [`mrexodia/ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp)
+
+本项目的目标不是替代上游，而是将 `ida-pro-mcp` 扩展到更适合 **CTF 多题并行分析** 的工作流中。
+
+---
+
+## License
+
+本项目遵循上游仓库的许可证，详见 [`LICENSE`](./LICENSE)。
+

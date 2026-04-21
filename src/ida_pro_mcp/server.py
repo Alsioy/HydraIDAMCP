@@ -3,6 +3,8 @@ import http.client
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 from typing import Annotated, Any, TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, urlparse
@@ -58,8 +60,11 @@ class ProxySelectResult(TypedDict, total=False):
     success: bool
     host: str
     port: int
+    binary: str
+    idb_path: str
     message: str
     error: str
+    candidates: list[ProxyInstanceInfo]
 
 
 class ProxyOpenFileResult(TypedDict, total=False):
@@ -74,13 +79,212 @@ class ProxyOpenFileResult(TypedDict, total=False):
     result: Any
 
 
+class ProxyCurrentInstanceResult(TypedDict, total=False):
+    host: str
+    port: int
+    pid: int
+    binary: str
+    idb_path: str
+    started_at: str
+    reachable: bool
+    source: str
+    message: str
+
+
 IDA_HOST = "127.0.0.1"
-IDA_PORT = 13337
+IDA_PORT = 13777
+_FALLBACK_SELECTED_TARGET: tuple[str, int] | None = None
+_SESSION_SELECTED_TARGETS: dict[str, tuple[str, int]] = {}
+_SESSION_SELECTED_TARGETS_LOCK = threading.Lock()
 
 mcp = McpServer("ida-pro-mcp")
+mcp.require_streamable_http_session = True
 dispatch_original = mcp.registry.dispatch
 
-LOCAL_TOOLS = {"list_instances", "select_instance", "open_file"}
+LOCAL_TOOLS = {
+    "list_instances",
+    "current_instance",
+    "select_instance",
+    "select_instance_by_binary",
+    "select_instance_by_idb",
+    "open_file",
+}
+
+
+def _get_current_transport_key() -> str | None:
+    """Return the current MCP transport session identifier, if any."""
+    return mcp.get_current_transport_session_id()
+
+
+def _get_default_target() -> tuple[str, int]:
+    """Return the proxy's startup/default IDA target."""
+    return (IDA_HOST, IDA_PORT)
+
+
+def _set_default_target(host: str, port: int) -> None:
+    """Update the process-wide default IDA target."""
+    global IDA_HOST, IDA_PORT
+    IDA_HOST = host
+    IDA_PORT = port
+    set_ida_rpc(host, port)
+
+
+def _get_explicit_selected_target() -> tuple[str, int] | None:
+    """Return a session/process explicit target override, if one exists."""
+    session_key = _get_current_transport_key()
+    if session_key is not None:
+        with _SESSION_SELECTED_TARGETS_LOCK:
+            target = _SESSION_SELECTED_TARGETS.get(session_key)
+        if target is not None:
+            return target
+
+    if _FALLBACK_SELECTED_TARGET is not None:
+        return _FALLBACK_SELECTED_TARGET
+
+    return None
+
+
+def _get_live_default_target() -> tuple[str, int]:
+    """Return a reachable default target, refreshing from discovery if needed."""
+    default_host, default_port = _get_default_target()
+    if probe_instance(default_host, default_port):
+        return (default_host, default_port)
+
+    for inst in discover_instances():
+        if probe_instance(inst["host"], inst["port"]):
+            if (inst["host"], inst["port"]) != (default_host, default_port):
+                _set_default_target(inst["host"], inst["port"])
+            return (inst["host"], inst["port"])
+
+    return (default_host, default_port)
+
+
+def _get_selected_target() -> tuple[str, int]:
+    """Return the IDA target bound to the current transport session."""
+    target = _get_explicit_selected_target()
+    if target is not None:
+        return target
+    return _get_live_default_target()
+
+
+def _get_selected_target_source() -> str:
+    """Describe how the current target was selected."""
+    session_key = _get_current_transport_key()
+    if session_key is not None:
+        with _SESSION_SELECTED_TARGETS_LOCK:
+            if session_key in _SESSION_SELECTED_TARGETS:
+                return "session"
+    if _FALLBACK_SELECTED_TARGET is not None:
+        return "process"
+    return "default"
+
+
+def _set_selected_target(host: str, port: int) -> None:
+    """Bind the current transport session to a specific IDA target."""
+    global _FALLBACK_SELECTED_TARGET
+    session_key = _get_current_transport_key()
+    if session_key is not None:
+        with _SESSION_SELECTED_TARGETS_LOCK:
+            _SESSION_SELECTED_TARGETS[session_key] = (host, port)
+        return
+    _FALLBACK_SELECTED_TARGET = (host, port)
+
+
+def _clear_selected_target() -> None:
+    """Clear the current transport session binding and fall back to default."""
+    global _FALLBACK_SELECTED_TARGET
+    session_key = _get_current_transport_key()
+    if session_key is not None:
+        with _SESSION_SELECTED_TARGETS_LOCK:
+            _SESSION_SELECTED_TARGETS.pop(session_key, None)
+        return
+    _FALLBACK_SELECTED_TARGET = None
+
+
+def _find_instance_info(host: str, port: int) -> ProxyInstanceInfo | None:
+    """Find discovery metadata for a specific IDA instance."""
+    for inst in discover_instances():
+        if inst["host"] == host and inst["port"] == port:
+            return {
+                **inst,
+                "reachable": True,
+                "active": False,
+            }
+    return None
+
+
+def _normalize_binary_name(binary: str) -> str:
+    """Normalize a binary name for case-insensitive matching."""
+    cleaned = (binary or "").strip().replace("\\", "/")
+    return os.path.basename(cleaned).casefold()
+
+
+def _normalize_idb_path(idb_path: str) -> str:
+    """Normalize an IDB path for case-insensitive path matching."""
+    cleaned = (idb_path or "").strip().replace("\\", "/")
+    return os.path.normpath(cleaned).replace("\\", "/").casefold()
+
+
+def _format_instance_brief(inst: ProxyInstanceInfo) -> ProxyInstanceInfo:
+    """Return a compact instance record for selection results."""
+    active_host, active_port = _get_selected_target()
+    return {
+        "host": inst["host"],
+        "port": inst["port"],
+        "pid": inst["pid"],
+        "binary": inst.get("binary", ""),
+        "idb_path": inst.get("idb_path", ""),
+        "started_at": inst.get("started_at", ""),
+        "reachable": probe_instance(inst["host"], inst["port"]),
+        "active": inst["host"] == active_host and inst["port"] == active_port,
+    }
+
+
+def _select_instance_from_matches(
+    matches: list[ProxyInstanceInfo],
+    selector_name: str,
+    selector_value: str,
+) -> ProxySelectResult:
+    """Bind the current MCP session to exactly one matching discovered instance."""
+    if len(matches) == 0:
+        return {
+            "success": False,
+            "error": (
+                f"No running IDA instance matches {selector_name}: {selector_value}"
+            ),
+        }
+
+    if len(matches) > 1:
+        return {
+            "success": False,
+            "error": (
+                f"Multiple running IDA instances match {selector_name}: "
+                f"{selector_value}"
+            ),
+            "candidates": [_format_instance_brief(inst) for inst in matches],
+        }
+
+    inst = matches[0]
+    if not probe_instance(inst["host"], inst["port"]):
+        return {
+            "success": False,
+            "error": (
+                f"Matched IDA instance at {inst['host']}:{inst['port']} is not reachable"
+            ),
+        }
+
+    _set_selected_target(inst["host"], inst["port"])
+    return {
+        "success": True,
+        "host": inst["host"],
+        "port": inst["port"],
+        "binary": inst.get("binary", ""),
+        "idb_path": inst.get("idb_path", ""),
+        "message": (
+            f"Selected IDA target for the current MCP session by "
+            f"{selector_name}: {selector_value}"
+        ),
+    }
 
 
 def _get_proxy_request_path() -> str:
@@ -130,7 +334,8 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
 
 def _proxy_to_ida(payload: bytes | str | dict) -> dict:
     """Send a JSON-RPC request to the active IDA instance and return the response."""
-    return _proxy_to_instance(IDA_HOST, IDA_PORT, payload)
+    host, port = _get_selected_target()
+    return _proxy_to_instance(host, port, payload)
 
 
 def _call_ida_tool(host: str, port: int, name: str, arguments: dict[str, Any]) -> Any:
@@ -214,6 +419,15 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         if request_id is None:
             return None  # Notification, no response needed
 
+        selected_target = _get_explicit_selected_target()
+        target_note = ""
+        if selected_target is not None and not probe_instance(*selected_target):
+            _clear_selected_target()
+            target_note = (
+                f"\nThe current MCP session binding to {selected_target[0]}:{selected_target[1]} "
+                "was cleared because that IDA instance is no longer reachable."
+            )
+
         shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
         return JsonRpcResponse(
             {
@@ -225,6 +439,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                         f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
                         "The request was not retried automatically. "
                         "If this was a mutating operation, verify IDA state before retrying.\n"
+                        f"{target_note}\n"
                         f"{full_info}"
                     ),
                     "data": str(e),
@@ -245,6 +460,7 @@ mcp.registry.dispatch = dispatch_proxy
 @mcp.tool
 def list_instances() -> list[ProxyInstanceInfo]:
     """List discovered IDA Pro instances and indicate which one is active."""
+    active_host, active_port = _get_selected_target()
     result = []
     for inst in discover_instances():
         reachable = probe_instance(inst["host"], inst["port"])
@@ -252,8 +468,36 @@ def list_instances() -> list[ProxyInstanceInfo]:
             {
                 **inst,
                 "reachable": reachable,
-                "active": inst["host"] == IDA_HOST and inst["port"] == IDA_PORT,
+                "active": inst["host"] == active_host and inst["port"] == active_port,
             }
+        )
+    return result
+
+
+@mcp.tool
+def current_instance() -> ProxyCurrentInstanceResult:
+    """Return the IDA instance currently bound to this MCP transport session."""
+    host, port = _get_selected_target()
+    result: ProxyCurrentInstanceResult = {
+        "host": host,
+        "port": port,
+        "reachable": probe_instance(host, port),
+        "source": _get_selected_target_source(),
+    }
+    inst = _find_instance_info(host, port)
+    if inst is not None:
+        result.update(
+            {
+                "pid": inst["pid"],
+                "binary": inst["binary"],
+                "idb_path": inst["idb_path"],
+                "started_at": inst["started_at"],
+            }
+        )
+    elif not result["reachable"]:
+        result["message"] = (
+            "The currently selected IDA instance is not reachable. "
+            "Use list_instances/select_instance to recover."
         )
     return result
 
@@ -268,23 +512,64 @@ def select_instance(
     Use list_instances first to see available instances, then select one by port.
     All subsequent tool calls will be routed to the selected instance.
     """
-    global IDA_HOST, IDA_PORT
     if port == 0:
-        IDA_HOST = "127.0.0.1"
-        IDA_PORT = 13337
-        set_ida_rpc(IDA_HOST, IDA_PORT)
+        _clear_selected_target()
+        default_host, default_port = _get_default_target()
         return {
             "success": True,
-            "host": IDA_HOST,
-            "port": IDA_PORT,
-            "message": "Reset to default IDA target",
+            "host": default_host,
+            "port": default_port,
+            "message": "Reset current MCP session to the default IDA target",
         }
     if not probe_instance(host, port):
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
-    IDA_HOST = host
-    IDA_PORT = port
-    set_ida_rpc(IDA_HOST, IDA_PORT)
-    return {"success": True, "host": host, "port": port}
+    _set_selected_target(host, port)
+    return {
+        "success": True,
+        "host": host,
+        "port": port,
+        "message": "Selected IDA target for the current MCP session",
+    }
+
+
+@mcp.tool
+def select_instance_by_binary(
+    binary: Annotated[
+        str,
+        "Binary filename to match, such as chall.exe or vm. Case-insensitive.",
+    ],
+) -> ProxySelectResult:
+    """Select a running IDA instance by its loaded binary filename."""
+    normalized_binary = _normalize_binary_name(binary)
+    if not normalized_binary:
+        return {"success": False, "error": "Binary name must not be empty"}
+
+    matches = [
+        inst
+        for inst in discover_instances()
+        if _normalize_binary_name(inst.get("binary", "")) == normalized_binary
+    ]
+    return _select_instance_from_matches(matches, "binary", binary.strip())
+
+
+@mcp.tool
+def select_instance_by_idb(
+    idb_path: Annotated[
+        str,
+        "Absolute IDB path to match, such as D:\\ctf\\chall.i64. Case-insensitive on Windows.",
+    ],
+) -> ProxySelectResult:
+    """Select a running IDA instance by its loaded IDB path."""
+    normalized_idb_path = _normalize_idb_path(idb_path)
+    if not normalized_idb_path:
+        return {"success": False, "error": "IDB path must not be empty"}
+
+    matches = [
+        inst
+        for inst in discover_instances()
+        if _normalize_idb_path(inst.get("idb_path", "")) == normalized_idb_path
+    ]
+    return _select_instance_from_matches(matches, "idb_path", idb_path.strip())
 
 
 @mcp.tool
@@ -311,8 +596,7 @@ def open_file(
     implementation so discovery/launch remains available even when the currently
     selected instance is down.
     """
-    target_host = IDA_HOST
-    target_port = IDA_PORT
+    target_host, target_port = _get_selected_target()
     if not probe_instance(target_host, target_port):
         target_host = ""
         target_port = 0
@@ -338,7 +622,10 @@ def open_file(
             "open_file",
             {
                 "file_path": file_path,
-                "switch": switch,
+                # Keep switching logic in the top-level proxy so we do not
+                # leave stale per-session redirects behind on the helper IDA
+                # instance that launched the new file.
+                "switch": False,
                 "autonomous": autonomous,
                 "new_database": new_database,
                 "timeout": timeout,
@@ -347,7 +634,14 @@ def open_file(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-    return result if isinstance(result, dict) else {"success": True, "result": result}
+    if not isinstance(result, dict):
+        return {"success": True, "result": result}
+
+    if switch and result.get("success") and result.get("host") and result.get("port"):
+        _set_selected_target(result["host"], result["port"])
+        result["switched"] = True
+
+    return result
 
 
 # ============================================================================
@@ -364,15 +658,13 @@ def _resolve_ida_rpc(args) -> None:
         ida_rpc = urlparse(args.ida_rpc)
         if ida_rpc.hostname is None or ida_rpc.port is None:
             raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
-        IDA_HOST = ida_rpc.hostname
-        IDA_PORT = ida_rpc.port
+        _set_default_target(ida_rpc.hostname, ida_rpc.port)
 
         # Preserve ?ext= query param so proxy requests include the extensions
         ext_value = parse_qs(ida_rpc.query).get("ext", [""])[0]
         if ext_value:
             mcp._enabled_extensions.data = set(ext_value.split(","))
 
-        set_ida_rpc(IDA_HOST, IDA_PORT)
         return
 
     # Auto-discover running IDA instances
@@ -384,8 +676,7 @@ def _resolve_ida_rpc(args) -> None:
         )
     elif len(instances) == 1:
         inst = instances[0]
-        IDA_HOST = inst["host"]
-        IDA_PORT = inst["port"]
+        _set_default_target(inst["host"], inst["port"])
         print(
             f"[MCP] Auto-connected to: {inst['binary']} at {IDA_HOST}:{IDA_PORT}",
             file=sys.stderr,
@@ -395,15 +686,12 @@ def _resolve_ida_rpc(args) -> None:
         for i, inst in enumerate(instances):
             print(f"  [{i}] {inst['binary']} at {inst['host']}:{inst['port']}", file=sys.stderr)
         inst = instances[0]
-        IDA_HOST = inst["host"]
-        IDA_PORT = inst["port"]
+        _set_default_target(inst["host"], inst["port"])
         print(
             f"[MCP] Auto-selected: {inst['binary']}. "
             "Use select_instance tool to switch.",
             file=sys.stderr,
         )
-
-    set_ida_rpc(IDA_HOST, IDA_PORT)
 
 
 def main():
@@ -465,6 +753,11 @@ def main():
         action="store_true",
         help="List all available MCP client targets",
     )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Keep HTTP/SSE transports alive without waiting for interactive stdin",
+    )
     args = parser.parse_args()
 
     # Handle --list-clients independently
@@ -509,7 +802,12 @@ def main():
                 raise Exception(f"Invalid transport URL: {args.transport}")
             # NOTE: npx -y @modelcontextprotocol/inspector for debugging
             mcp.serve(url.hostname, url.port)
-            input("Server is running, press Enter or Ctrl+C to stop.")
+            if args.background or not sys.stdin or not sys.stdin.isatty():
+                print("Server is running in background mode. Press Ctrl+C to stop.")
+                while True:
+                    time.sleep(3600)
+            else:
+                input("Server is running, press Enter or Ctrl+C to stop.")
     except (KeyboardInterrupt, EOFError):
         pass
 
