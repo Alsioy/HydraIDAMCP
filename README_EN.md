@@ -107,17 +107,17 @@ So different sessions can stay attached to different targets instead of competin
 For source-based installation:
 
 ```bash
-git clone https://github.com/<your-name>/HydraIDAMCP.git
+git clone https://github.com/Alsioy/HydraIDAMCP.git
 cd HydraIDAMCP
 pip uninstall ida-pro-mcp -y
 pip install -e .
 ```
 
-After you publish the repository, you can also install directly from GitHub:
+You can also install directly from GitHub:
 
 ```bash
 pip uninstall ida-pro-mcp -y
-pip install git+https://github.com/<your-name>/HydraIDAMCP.git
+pip install git+https://github.com/Alsioy/HydraIDAMCP.git
 ```
 
 ### 2) Install the IDA plugin
@@ -183,7 +183,7 @@ So in most cases, your workflow becomes:
 ### Option A: Install from source
 
 ```bash
-git clone https://github.com/<your-name>/HydraIDAMCP.git
+git clone https://github.com/Alsioy/HydraIDAMCP.git
 cd HydraIDAMCP
 pip uninstall ida-pro-mcp -y
 pip install -e .
@@ -194,7 +194,7 @@ ida-pro-mcp --install
 
 ```bash
 pip uninstall ida-pro-mcp -y
-pip install git+https://github.com/<your-name>/HydraIDAMCP.git
+pip install git+https://github.com/Alsioy/HydraIDAMCP.git
 ida-pro-mcp --install
 ```
 
@@ -398,33 +398,6 @@ pip uninstall ida-pro-mcp -y
 pip install -e .
 ```
 
-### Why do multiple active challenges still feel serialized sometimes?
-
-This is not always caused by HydraMCP itself.  
-Observed concurrency also depends on:
-
-- the MCP client's scheduling behavior
-- the model provider's tool-calling queue
-- long-running individual tool calls
-
-HydraMCP solves:
-
-> **coexistence, discovery, selection, switching, and routing of multiple IDA instances**
-
-It does not force every client to send requests in parallel.
-
-### What if IDA reports a `U+FEFF` / BOM error?
-
-Make sure the plugin file is saved as:
-
-- UTF-8 **without BOM**
-
-Otherwise IDA may fail with:
-
-```text
-invalid non-printable character U+FEFF
-```
-
 ---
 
 ## Roadmap
@@ -436,42 +409,6 @@ The current version is already usable for multi-challenge workflows, but there i
 - [ ] prompt template profiles for RE / PWN / Malware
 - [ ] automatic cleanup after abnormal exits
 - [ ] more compatibility testing with MCP clients
-
----
-
-## Recommended GitHub Metadata
-
-**Repository name**
-
-```text
-HydraIDAMCP
-```
-
-**Short name**
-
-```text
-HydraMCP
-```
-
-**Description**
-
-```text
-A multi-session enhancement of ida-pro-mcp with a shared proxy, per-session instance routing, and auto-generated prompts for parallel IDA workflows.
-```
-
-**Topics**
-
-```text
-ida
-mcp
-ctf
-reverse-engineering
-binary-analysis
-idapro
-llm-tools
-codex
-claude-code
-```
 
 ---
 
@@ -488,4 +425,3 @@ The goal is not to replace the upstream project, but to extend it for **parallel
 ## License
 
 This project follows the upstream repository license. See [`LICENSE`](./LICENSE).
-

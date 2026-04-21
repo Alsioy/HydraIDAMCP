@@ -19,7 +19,7 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green" />
 </p>
 
-HydraIDAMCP（简称 **HydraMCP**）是基于 [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) 的增强版本，主要解决 **CTF / RE / PWN / Malware** 等场景下“**同时打开多个 IDA，但模型总是容易连错实例**”的问题。
+HydraIDAMCP（简称 **HydraMCP**）是基于 [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) 的增强版本，主要解决 **CTF / RE / PWN / Malware** 等场景下“同时打开多个 IDA，但模型容易连错实例”的问题。
 
 它不是重写一个新的 MCP，而是在原有插件和服务架构基础上增加了：
 
@@ -27,7 +27,7 @@ HydraIDAMCP（简称 **HydraMCP**）是基于 [`ida-pro-mcp`](https://github.com
 - **多 IDA 实例并行**：每个 IDA 使用独立本地端口
 - **按会话绑定实例**：不同 MCP 会话可绑定到不同 IDA
 - **实例选择工具**：支持按 `binary` 或 `idb` 精确切换
-- **自动生成提示词**：启动后直接生成可发给模型的 prompt
+- **自动生成 prompt**：启动后直接生成可发给模型的提示词
 - **支持自定义 prompt 模板**：保留你的个人分析习惯
 
 > 如果你经常同时开多个题、多个 IDA、多个对话窗口，HydraMCP 的目标就是：**始终让模型分析到正确的那个实例。**
@@ -61,10 +61,10 @@ HydraIDAMCP（简称 **HydraMCP**）是基于 [`ida-pro-mcp`](https://github.com
 
 但在真实的 CTF 二进制题场景里，往往是：
 
-- 同时打开 2~5 个 IDA
+- 同时打开多个 IDA
 - 每个题一个 IDB
-- 模型需要明确知道“当前到底分析哪一个”
-- 不希望每开一个 IDA 就去修改一次 MCP 配置
+- 模型需要明确知道当前到底分析哪一个
+- 不希望每开一个 IDA 就手动改一遍 MCP 配置
 
 HydraIDAMCP 解决的核心问题就是：
 
@@ -107,17 +107,17 @@ flowchart LR
 如果你是从源码使用，推荐这样安装：
 
 ```bash
-git clone https://github.com/<你的用户名>/HydraIDAMCP.git
+git clone https://github.com/Alsioy/HydraIDAMCP.git
 cd HydraIDAMCP
 pip uninstall ida-pro-mcp -y
 pip install -e .
 ```
 
-如果你后续发布到了 GitHub，也可以直接安装：
+如果你想直接从 GitHub 安装：
 
 ```bash
 pip uninstall ida-pro-mcp -y
-pip install git+https://github.com/<你的用户名>/HydraIDAMCP.git
+pip install git+https://github.com/Alsioy/HydraIDAMCP.git
 ```
 
 ### 2）安装插件到 IDA
@@ -126,7 +126,7 @@ pip install git+https://github.com/<你的用户名>/HydraIDAMCP.git
 ida-pro-mcp --install
 ```
 
-> 命令名依然是 `ida-pro-mcp`，这是兼容设计，不是写错了。
+> 命令名依然是 `ida-pro-mcp`，这是兼容设计，不是写错。
 
 ### 3）配置 MCP 客户端
 
@@ -183,7 +183,7 @@ Ctrl + Alt + M
 ### 方式一：从源码安装
 
 ```bash
-git clone https://github.com/<你的用户名>/HydraIDAMCP.git
+git clone https://github.com/Alsioy/HydraIDAMCP.git
 cd HydraIDAMCP
 pip uninstall ida-pro-mcp -y
 pip install -e .
@@ -194,7 +194,7 @@ ida-pro-mcp --install
 
 ```bash
 pip uninstall ida-pro-mcp -y
-pip install git+https://github.com/<你的用户名>/HydraIDAMCP.git
+pip install git+https://github.com/Alsioy/HydraIDAMCP.git
 ida-pro-mcp --install
 ```
 
@@ -398,33 +398,6 @@ pip uninstall ida-pro-mcp -y
 pip install -e .
 ```
 
-### 为什么多个题同时开着，但模型看起来还是串行的？
-
-这通常不完全是 HydraMCP 的问题。  
-并发体验还会受到这些因素影响：
-
-- MCP 客户端本身的工具调度策略
-- 模型供应商的 tool-calling 排队机制
-- 单次工具调用耗时较长
-
-HydraMCP 解决的是：
-
-> **多实例可并存、可发现、可绑定、可切换、可路由**
-
-但不强制所有客户端都并行发请求。
-
-### 如果 IDA 报 `U+FEFF` / BOM 错误怎么办？
-
-请确保插件文件编码为：
-
-- UTF-8 **无 BOM**
-
-否则 IDA 可能报：
-
-```text
-invalid non-printable character U+FEFF
-```
-
 ---
 
 ## 路线图
@@ -436,42 +409,6 @@ invalid non-printable character U+FEFF
 - [ ] 按题型划分的 prompt 模板（RE / PWN / Malware）
 - [ ] 异常退出后的实例自动清理
 - [ ] 更多 MCP 客户端兼容性测试
-
----
-
-## 建议的 GitHub 信息
-
-**仓库名**
-
-```text
-HydraIDAMCP
-```
-
-**简称**
-
-```text
-HydraMCP
-```
-
-**描述**
-
-```text
-ida-pro-mcp 的多会话增强版，提供共享代理、实例路由与自动生成 prompt，适合多 IDA 并行分析。
-```
-
-**Topics**
-
-```text
-ida
-mcp
-ctf
-reverse-engineering
-binary-analysis
-idapro
-llm-tools
-codex
-claude-code
-```
 
 ---
 
@@ -488,4 +425,3 @@ HydraIDAMCP 基于以下项目构建：
 ## License
 
 本项目遵循上游仓库的许可证，详见 [`LICENSE`](./LICENSE)。
-
